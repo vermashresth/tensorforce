@@ -1,4 +1,4 @@
-# Copyright 2017 reinforce.io. All Rights Reserved.
+# Copyright 2018 Tensorforce Team. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,128 +13,162 @@
 # limitations under the License.
 # ==============================================================================
 
-from __future__ import absolute_import
-from __future__ import print_function
-from __future__ import division
-
-from math import log
 import tensorflow as tf
 
 from tensorforce import util
-from tensorforce.core.networks import Linear
+from tensorforce.core import layer_modules, Module
 from tensorforce.core.distributions import Distribution
 
 
 class Categorical(Distribution):
     """
-    Categorical distribution, for discrete actions.
+    Categorical distribution, for discrete integer actions (specification key: `categorical`).
+
+    Args:
+        name (string): Distribution name
+            (<span style="color:#0000C0"><b>internal use</b></span>).
+        action_spec (specification): Action specification
+            (<span style="color:#0000C0"><b>internal use</b></span>).
+        embedding_size (int > 0): Embedding size
+            (<span style="color:#0000C0"><b>internal use</b></span>).
+        infer_states_value (bool): Whether to infer the state value from state-action values as
+            softmax denominator (<span style="color:#00C000"><b>default</b></span>: true).
+        summary_labels ('all' | iter[string]): Labels of summaries to record
+            (<span style="color:#00C000"><b>default</b></span>: inherit value of parent module).
     """
 
-    def __init__(self, shape, num_actions, probabilities=None, scope='categorical', summary_labels=()):
-        """
-        Categorical distribution.
-
-        Args:
-            shape: Action shape.
-            num_actions: Number of discrete action alternatives.
-            probabilities: Optional distribution bias.
-        """
-        self.num_actions = num_actions
-
-        action_size = util.prod(shape) * self.num_actions
-        if probabilities is None:
-            logits = 0.0
+    def __init__(
+        self, name, action_spec, embedding_size, infer_states_value=True, summary_labels=None
+    ):
+        super().__init__(
+            name=name, action_spec=action_spec, embedding_size=embedding_size,
+            summary_labels=summary_labels
+        )
+        shape = self.action_spec['shape']
+        num_values = self.action_spec['num_values']
+        action_size = util.product(xs=shape)
+        input_spec = dict(type='float', shape=(self.embedding_size,))
+        self.deviations = self.add_module(
+            name='deviations', module='linear', modules=layer_modules,
+            size=(action_size * num_values), input_spec=input_spec
+        )
+        if infer_states_value:
+            self.value = None
         else:
-            logits = [log(prob) for _ in range(util.prod(shape)) for prob in probabilities]
-        self.logits = Linear(size=action_size, bias=logits, scope='logits', summary_labels=summary_labels)
+            self.value = self.add_module(
+                name='value', module='linear', modules=layer_modules, size=action_size,
+                input_spec=input_spec
+            )
 
-        super(Categorical, self).__init__(shape=shape, scope=scope, summary_labels=summary_labels)
+        Module.register_tensor(
+            name=(self.name + '-probabilities'),
+            spec=dict(type='float', shape=(shape + (num_values,))), batched=True
+        )
 
-    def tf_parameterize(self, x):
-        # Flat logits
-        logits = self.logits.apply(x=x)
+    def tf_parametrize(self, x, mask):
+        epsilon = tf.constant(value=util.epsilon, dtype=util.tf_dtype(dtype='float'))
 
-        # Reshape logits to action shape
-        shape = (-1,) + self.shape + (self.num_actions,)
-        logits = tf.reshape(tensor=logits, shape=shape)
+        # Deviations
+        action_values = self.deviations.apply(x=x)
+        shape = (-1,) + self.action_spec['shape'] + (self.action_spec['num_values'],)
+        action_values = tf.reshape(tensor=action_values, shape=shape)
+        min_float = tf.fill(
+            dims=tf.shape(input=action_values), value=util.tf_dtype(dtype='float').min
+        )
 
-        # !!!
-        state_value = tf.reduce_logsumexp(input_tensor=logits, axis=-1)
+        # States value
+        if self.value is None:
+            action_values = tf.where(condition=mask, x=action_values, y=min_float)
+            states_value = tf.reduce_logsumexp(input_tensor=action_values, axis=-1)
+        else:
+            states_value = self.value.apply(x=x)
+            shape = (-1,) + self.action_spec['shape'] + (1,)
+            states_value = tf.reshape(tensor=states_value, shape=shape)
+            action_values = states_value + action_values - tf.math.reduce_mean(
+                input_tensor=action_values, axis=-1, keepdims=True
+            )
+            states_value = tf.squeeze(input=states_value, axis=-1)
+            action_values = tf.where(condition=mask, x=action_values, y=min_float)
 
         # Softmax for corresponding probabilities
-        probabilities = tf.nn.softmax(logits=logits, axis=-1)
-
-        # Min epsilon probability for numerical stability
-        probabilities = tf.maximum(x=probabilities, y=util.epsilon)
+        probabilities = tf.nn.softmax(logits=action_values, axis=-1)
 
         # "Normalized" logits
-        logits = tf.log(x=probabilities)
+        logits = tf.log(x=tf.maximum(x=probabilities, y=epsilon))
 
-        return logits, probabilities, state_value
+        # Logits as pass_tensor since used for sampling
+        Module.update_tensor(name=(self.name + '-probabilities'), tensor=probabilities)
+        logits, probabilities, states_value, action_values = self.add_summary(
+            label=('distributions', 'categorical'), name='probabilities', tensor=probabilities,
+            pass_tensors=(logits, probabilities, states_value, action_values),
+            enumerate_last_rank=True
+        )
 
-    def state_value(self, distr_params):
-        _, _, state_value = distr_params
-        return state_value
+        return logits, probabilities, states_value, action_values
 
-    def state_action_value(self, distr_params, action=None):
-        logits, _, state_value = distr_params
-        if action is None:
-            state_value = tf.expand_dims(input=state_value, axis=-1)
-        else:
-            one_hot = tf.one_hot(indices=action, depth=self.num_actions)
-            logits = tf.reduce_sum(input_tensor=(logits * one_hot), axis=-1)
-        return state_value + logits
+    def tf_sample(self, parameters, temperature):
+        logits, probabilities, _, _ = parameters
 
-    def tf_sample(self, distr_params, deterministic):
-        logits, _, _ = distr_params
+        one = tf.constant(value=1.0, dtype=util.tf_dtype(dtype='float'))
+        epsilon = tf.constant(value=util.epsilon, dtype=util.tf_dtype(dtype='float'))
 
         # Deterministic: maximum likelihood action
-        definite = tf.argmax(input=logits, axis=-1, output_type=util.tf_dtype('int'))
+        definite = tf.argmax(input=logits, axis=-1)
+        definite = tf.dtypes.cast(x=definite, dtype=util.tf_dtype('int'))
+
+        # Set logits to minimal value
+        min_float = tf.fill(dims=tf.shape(input=logits), value=util.tf_dtype(dtype='float').min)
+        logits = logits / temperature
+        logits = tf.where(condition=(probabilities < epsilon), x=min_float, y=logits)
 
         # Non-deterministic: sample action using Gumbel distribution
-        uniform_distribution = tf.random_uniform(
-            shape=tf.shape(input=logits),
-            minval=util.epsilon,
-            maxval=(1.0 - util.epsilon)
+        uniform_distribution = tf.random.uniform(
+            shape=tf.shape(input=logits), minval=epsilon, maxval=(one - epsilon),
+            dtype=util.tf_dtype(dtype='float')
         )
         gumbel_distribution = -tf.log(x=-tf.log(x=uniform_distribution))
-        sampled = tf.argmax(input=(logits + gumbel_distribution), axis=-1, output_type=util.tf_dtype('int'))
+        sampled = tf.argmax(input=(logits + gumbel_distribution), axis=-1)
+        sampled = tf.dtypes.cast(x=sampled, dtype=util.tf_dtype('int'))
 
-        return tf.where(condition=deterministic, x=definite, y=sampled)
+        return tf.where(condition=(temperature < epsilon), x=definite, y=sampled)
 
-    def tf_log_probability(self, distr_params, action):
-        logits, _, _ = distr_params
-        one_hot = tf.one_hot(indices=action, depth=self.num_actions)
-        return tf.reduce_sum(input_tensor=(logits * one_hot), axis=-1)
+    def tf_log_probability(self, parameters, action):
+        logits, _, _, _ = parameters
 
-    def tf_entropy(self, distr_params):
-        logits, probabilities, _ = distr_params
+        if util.tf_dtype(dtype='int') not in (tf.int32, tf.int64):
+            action = tf.dtypes.cast(x=action, dtype=tf.int32)
+
+        logits = tf.batch_gather(params=logits, indices=tf.expand_dims(input=action, axis=-1))
+
+        return tf.squeeze(input=logits, axis=-1)
+
+    def tf_entropy(self, parameters):
+        logits, probabilities, _, _ = parameters
+
         return -tf.reduce_sum(input_tensor=(probabilities * logits), axis=-1)
 
-    def tf_kl_divergence(self, distr_params1, distr_params2):
-        logits1, probabilities1, _ = distr_params1
-        logits2, _, _ = distr_params2
+    def tf_kl_divergence(self, parameters1, parameters2):
+        logits1, probabilities1, _, _ = parameters1
+        logits2, _, _, _ = parameters2
+
         log_prob_ratio = logits1 - logits2
+
         return tf.reduce_sum(input_tensor=(probabilities1 * log_prob_ratio), axis=-1)
 
-    def tf_regularization_loss(self):
-        regularization_loss = super(Categorical, self).tf_regularization_loss()
-        if regularization_loss is None:
-            losses = list()
-        else:
-            losses = [regularization_loss]
+    def tf_action_value(self, parameters, action=None):
+        _, _, _, action_values = parameters
 
-        regularization_loss = self.logits.regularization_loss()
-        if regularization_loss is not None:
-            losses.append(regularization_loss)
+        if action is not None:
+            if util.tf_dtype(dtype='int') not in (tf.int32, tf.int64):
+                action = tf.dtypes.cast(x=action, dtype=tf.int32)
 
-        if len(losses) > 0:
-            return tf.add_n(inputs=losses)
-        else:
-            return None
+            action = tf.expand_dims(input=action, axis=-1)
+            action_values = tf.batch_gather(params=action_values, indices=action)
+            action_values = tf.squeeze(input=action_values, axis=-1)
 
-    def get_variables(self, include_nontrainable=False):
-        distribution_variables = super(Categorical, self).get_variables(include_nontrainable=include_nontrainable)
-        logits_variables = self.logits.get_variables(include_nontrainable=include_nontrainable)
+        return action_values  # states_value + tf.squeeze(input=logits, axis=-1)
 
-        return distribution_variables + logits_variables
+    def tf_states_value(self, parameters):
+        _, _, states_value, _ = parameters
+
+        return states_value
